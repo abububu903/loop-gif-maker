@@ -55,6 +55,10 @@ button.prim:hover:not(:disabled) { color:#fff; opacity:.9; }
 #dropSize:not(:empty) { margin-top:3px; }
 #preview { display:flex; flex-direction:column; align-items:center; padding:18px; overflow:auto; }
 #stage { background:#fff; border:1px solid var(--bd); border-radius:8px; max-width:100%; height:auto; }
+/* 透明模式下铺棋盘格：GIF 只有单色透明，边缘质量必须能看出「透在哪、糊在哪」 */
+#stage.alpha { background-image:
+  conic-gradient(#e9e9ee 0 25%, #fff 0 50%, #e9e9ee 0 75%, #fff 0);
+  background-size:16px 16px; }
 #scrubrow { display:flex; align-items:center; gap:10px; width:min(480px,90%); margin-top:12px; }
 #scrub { flex:1; min-width:0; height:16px; margin:0; padding:0; border:0; background:none;
          -webkit-appearance:none; appearance:none; cursor:pointer; }
@@ -93,9 +97,8 @@ fieldset { border:0; margin:0; padding:0; min-width:0; display:contents; }
                       transform:rotate(45deg); transition:transform .15s ease; }
 .grp:not([open]) > summary::after { transform:rotate(-45deg); }
 .grp > .sectitle { font-size:12px; color:var(--dim); font-weight:600; padding:6px 0; }
-#status { color:var(--dim); font-size:12px; overflow:hidden; text-overflow:ellipsis;
-          white-space:nowrap; max-width:30vw; }
 .muted { color:var(--dim); padding:10px 12px; font-size:12px; }
+input[type=color] { width:100%; min-width:0; height:29px; padding:2px; }
 .hit { color:var(--dim); font-size:11px; padding:1px 0 3px; }
 .hit:empty { display:none; }
 #toast { position:fixed; left:50%; bottom:26px; transform:translate(-50%,8px); display:flex;
@@ -105,6 +108,8 @@ fieldset { border:0; margin:0; padding:0; min-width:0; display:contents; }
 #toast.on { opacity:1; transform:translate(-50%,0); }
 #toast svg { flex:none; color:#5fd07a; }
 #toast.bad svg { color:#ff7a7a; }
+/* 进度态没有成功/失败图标，整块收起，文案不会因图标位右移 */
+#toast.run svg { display:none; }
 #modal { position:fixed; inset:0; z-index:50; display:flex; align-items:center; justify-content:center; }
 #modal[hidden] { display:none; }
 #modal .mask { position:absolute; inset:0; background:rgba(24,24,28,.35); }
@@ -126,7 +131,6 @@ fieldset { border:0; margin:0; padding:0; min-width:0; display:contents; }
   <span class="brand">gif工具</span>
   <span class="tagline">把插画拆成同尺寸透明PNG拖进来，逐层加动画，一键出循环GIF</span>
   <span style="flex:1"></span>
-  <span id="status"></span>
   <span class="author">作者：abububu903</span>
   <div class="menu" id="fileMenu">
     <button id="fileBtn">文件
@@ -224,6 +228,7 @@ const sanitize = sc => {
     if (!Object.keys(a).length) delete o.animate[k];
   }
   delete o.shimmer; delete o.__on;
+  if (!o.alpha) { delete o.alpha; delete o.alphaMatte; }
   return o;
 };
 
@@ -344,10 +349,12 @@ function shimMask(a, shim) {
   return a._m = { slope, n: xs.length, x: Int32Array.from(xs), y: Int32Array.from(ys) };
 }
 
-function paintFrame(ctx, w, h, i) {
+function paintFrame(ctx, w, h, i, alpha) {
   const t = i / scene.frames;
   ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h);
+  ctx.clearRect(0, 0, w, h);
+  // 白底是「导出必不透明」的老前提；透明模式改由 GCE 的透明索引表达，这里不再铺色
+  if (!alpha) { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); }
   for (const name of scene.stack) {
     const a = assets[name]; if (!a) continue;
     const an = scene.animate[name] || {};
@@ -385,8 +392,19 @@ function paintFrame(ctx, w, h, i) {
         const x = Math.round(mx) + dx, y = Math.round(my) + dy;
         if (x < 0 || y < 0 || x >= w || y >= h) continue;
         const kk = Math.exp(-u * u) * str, o = (y * w + x) * 4;
-        d[o] += (255 - d[o]) * kk; d[o + 1] += (255 - d[o + 1]) * kk;
-        d[o + 2] += (255 - d[o + 2]) * kk;
+        if (!alpha) {
+          d[o] += (255 - d[o]) * kk; d[o + 1] += (255 - d[o + 1]) * kk;
+          d[o + 2] += (255 - d[o + 2]) * kk;
+        } else {
+          /* getImageData/putImageData 走的是预乘 alpha：纯透明处 rgb 必为 0，
+             所以先按 a/255 还原出直通色再提亮，最后把同一个系数乘回 alpha 上——
+             只提 rgb 不提 a 的话，合成结果没变化，透明模式下扫光等于没开。 */
+          const al = d[o + 3];
+          if (!al) continue;
+          const k = 1 + (255 / al - 1) * kk;
+          d[o] *= k; d[o + 1] *= k; d[o + 2] *= k;
+          d[o + 3] = Math.min(255, al * (1 + kk));
+        }
       }
       ctx.putImageData(img, 0, 0);
     }
@@ -439,36 +457,59 @@ function lzAxis(inSize, outSize) {
   }
   return { start, w, taps };
 }
-/* src 是 RGBA（画布已铺白，alpha 恒为 255），只对 RGB 做两趟可分离卷积 */
-function resampleLZ(src, sw, sh, dw, dh) {
-  if (sw === dw && sh === dh) return src;
+/* quantizeFrame 收到的一律是「直通色 + alpha」，而画布 getImageData 交出来的是预乘色。
+   两条出口（1:1 快速路径 / 重采样）都得自己还原，别一处除一处不除：
+   快速路径漏掉的话，低 alpha 处被压暗的 rgb 会冒充透明边缘混进色表。 */
+function straightRGB(px) {
+  for (let i = 0; i < px.length; i += 4) {
+    const a = px[i + 3];
+    if (a > 0 && a < 255) { const k = 255 / a;
+      px[i] *= k; px[i + 1] *= k; px[i + 2] *= k; }
+  }
+  return px;
+}
+/* 卷积全程在预乘空间里做：透明处画布给的 rgb 恒为 0，a=0 的抽头自然只贡献 0，
+   不用逐抽头 255/a 去放大噪声，末端按还原后的 a 一次性除回来。
+   alpha=false 时源图已铺白、a 恒 255，与逐字节老版一致。 */
+function resampleLZ(src, sw, sh, dw, dh, alpha) {
+  if (sw === dw && sh === dh) return alpha ? straightRGB(src) : src;
+  const NC = alpha ? 4 : 3;
   const ax = lzAxis(sw, dw), ay = lzAxis(sh, dh);
-  const tmp = new Float64Array(dw * sh * 3);
+  const tmp = new Float64Array(dw * sh * NC);
   for (let y = 0; y < sh; y++) {
-    const rowIn = y * sw * 4, rowOut = y * dw * 3;
+    const rowIn = y * sw * 4, rowOut = y * dw * NC;
     for (let x = 0; x < dw; x++) {
-      let r = 0, g = 0, b = 0;
+      const acc = [0, 0, 0, 0];
       const base = ax.start[x], off = x * ax.taps;
       for (let j = 0; j < ax.taps; j++) {
         const o = rowIn + (base + j) * 4, wt = ax.w[off + j];
-        r += src[o] * wt; g += src[o + 1] * wt; b += src[o + 2] * wt;
+        for (let c = 0; c < NC; c++) acc[c] += src[o + c] * wt;
       }
-      const t = rowOut + x * 3;
-      tmp[t] = r; tmp[t + 1] = g; tmp[t + 2] = b;
+      const t = rowOut + x * NC;
+      for (let c = 0; c < NC; c++) tmp[t + c] = acc[c];
     }
   }
   const out = new Uint8ClampedArray(dw * dh * 4);
   for (let y = 0; y < dh; y++) {
     const rowOut = y * dw * 4;
     for (let x = 0; x < dw; x++) {
-      let r = 0, g = 0, b = 0;
+      const acc = [0, 0, 0, 0];
       const base = ay.start[y], off = y * ay.taps;
       for (let j = 0; j < ay.taps; j++) {
-        const t = ((base + j) * dw + x) * 3, wt = ay.w[off + j];
-        r += tmp[t] * wt; g += tmp[t + 1] * wt; b += tmp[t + 2] * wt;
+        const t = ((base + j) * dw + x) * NC, wt = ay.w[off + j];
+        for (let c = 0; c < NC; c++) acc[c] += tmp[t + c] * wt;
       }
       const o = rowOut + x * 4;
-      out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255;
+      if (alpha) {
+        /* a 先落到 8bit 再拿它除：否则 rgb 除的基数和下游读到的 a 不是同一个数 */
+        const a = Math.round(acc[3]);
+        out[o + 3] = a;
+        if (a > 0) { const k = 255 / a;
+          out[o] = acc[0] * k; out[o + 1] = acc[1] * k; out[o + 2] = acc[2] * k; }
+      } else {
+        for (let c = 0; c < NC; c++) out[o + c] = acc[c];
+        out[o + 3] = 255;
+      }
     }
   }
   return out;
@@ -481,11 +522,12 @@ function draw(i) {
   cv.width = Math.round(scene.w * dpr); cv.height = Math.round(scene.h * dpr);
   cv.style.width = scene.w + 'px';
   const ctx = cv.getContext('2d');
+  cv.classList.toggle('alpha', !!(scene.alpha && has));
   ctx.clearRect(0, 0, cv.width, cv.height);
   if (has) {
     const w = CW(), h = CH();
     layerBuf.width = w; layerBuf.height = h;
-    paintFrame(layerBuf.getContext('2d', { willReadFrequently: true }), w, h, cur);
+    paintFrame(layerBuf.getContext('2d', { willReadFrequently: true }), w, h, cur, !!scene.alpha);
     blit(ctx, layerBuf, cv.width, cv.height);
   }
   const sb = $('#scrub');
@@ -573,8 +615,9 @@ function fld(label, path, kind, opts) {
     }
   } else if (kind === 'check') { el = document.createElement('input'); el.type = 'checkbox';
     el.checked = !!getPath(scene, path);
-  } else { el = document.createElement('input'); el.type = kind === 'text' ? 'text' : 'number';
-    el.value = getPath(scene, path) ?? '';
+  } else { el = document.createElement('input');
+    el.type = kind === 'color' ? 'color' : kind === 'text' ? 'text' : 'number';
+    el.value = getPath(scene, path) ?? (kind === 'color' ? '#ffffff' : '');
     if (kind === 'number') { el.step = opts?.step ?? 'any'; el.min = opts?.min ?? ''; }
   }
   if (opts?.disabled) { el.disabled = true; wrap.classList.add('off'); }
@@ -650,6 +693,9 @@ function renderProps() {
   const names = scene.stack.map(n => [n, n]);
   const k = s => [sel, s];
   const body = nodes => sel ? nodes : [noSelTip()];
+  const alphaOff = !getPath(scene, ['alpha']);
+  // 边缘色和勾选框同排：勾上「透明背景」才多出一个控件，取消勾选这排又收回一整格
+  const alphaRow = alphaOff ? [] : [fld('边缘色', 'alphaMatte', 'color')];
 
   f.appendChild(sect('导出设置', [
     pair(fld('宽', 'w', 'number', { min: 16, step: 1 }),
@@ -657,7 +703,8 @@ function renderProps() {
     pair(fld('帧数', 'frames', 'number', { min: 2, step: 1 }),
          // 时长下限 20ms：GIF 的延时单位是百分之一秒，界面编码器又按「不早于 2cs」写；
          // 低于 20 时 CLI（PIL 会写 1cs）和界面出的文件速度就差一倍，索性不让填
-         fld('时长ms', 'duration', 'number', { min: 20, step: 10 }))]));
+         fld('时长ms', 'duration', 'number', { min: 20, step: 10 })),
+    pair(fld('透明背景', 'alpha', 'check'), ...alphaRow)]));
 
   if (scene.stack.length) {
     f.appendChild(grp('位移', body([
@@ -752,24 +799,30 @@ function widestChannel(b) {
   }
   return best;
 }
-function paletteOf(px) {
+function paletteOf(px, reserved) {
+  const off = reserved ? 1 : 0;
   const counts = new Map();
   for (let i = 0; i < px.length; i += 4) {
     const k = (px[i] << 16) | (px[i + 1] << 8) | px[i + 2];
     counts.set(k, (counts.get(k) || 0) + 1);
   }
   let boxes = [[...counts.entries()]];
-  while (boxes.length < 256) {
+  /* 每轮都重扫所有盒子求最宽的话，256 次分裂就是 O(256·N)：8 帧取样一跑就是几十秒。
+     宽度只在分裂后对两个新盒重算，其余照旧。 */
+  const widths = [boxWidth(boxes[0])];
+  while (boxes.length < 256 - off) {
     let bi = -1, bw = -1;
     for (let i = 0; i < boxes.length; i++)
-      if (boxes[i].length > 1) { const w = boxWidth(boxes[i]); if (w > bw) { bw = w; bi = i; } }
+      if (boxes[i].length > 1 && widths[i] > bw) { bw = widths[i]; bi = i; }
     if (bi < 0) break;
     const b = boxes[bi], ch = widestChannel(b);
     b.sort((x, y) => chan(x[0], ch) - chan(y[0], ch));
     let half = b.reduce((s, e) => s + e[1], 0) / 2, acc = 0, k = 0;
     for (; k < b.length; k++) { acc += b[k][1]; if (acc >= half) break; }
     if (k === 0) k = 1; if (k >= b.length) k = b.length - 1;
-    boxes.splice(bi, 1, b.slice(0, k), b.slice(k));
+    const L = b.slice(0, k), R = b.slice(k);
+    boxes.splice(bi, 1, L, R);
+    widths.splice(bi, 1, boxWidth(L), boxWidth(R));
   }
   const pal = new Uint8Array(768);
   let last = [0, 0, 0];
@@ -778,27 +831,69 @@ function paletteOf(px) {
     for (const [c, w] of b) { r += ((c >> 16) & 255) * w; g += ((c >> 8) & 255) * w;
                               bl += (c & 255) * w; n += w; }
     last = [r / n, g / n, bl / n];
-    pal[i * 3] = last[0]; pal[i * 3 + 1] = last[1]; pal[i * 3 + 2] = last[2];
+    const q = (i + off) * 3;
+    pal[q] = last[0]; pal[q + 1] = last[1]; pal[q + 2] = last[2];
   });
-  for (let i = boxes.length; i < 256; i++) {
-    pal[i * 3] = last[0]; pal[i * 3 + 1] = last[1]; pal[i * 3 + 2] = last[2];
+  // 索引 0 留给透明色，其 RGB 值无意义，填黑即可
+  for (let i = boxes.length + off; i < 256; i++) {
+    const q = i * 3;
+    pal[q] = last[0]; pal[q + 1] = last[1]; pal[q + 2] = last[2];
   }
   return pal;
 }
-function colorMapper(pal) {
+function colorMapper(pal, reserved) {
+  const off = reserved ? 1 : 0;
   const cache = new Map();
   return (r, g, b) => {
     const key = (r << 16) | (g << 8) | b;
     let hit = cache.get(key);
     if (hit !== undefined) return hit;
-    let best = 0, bd = Infinity;
-    for (let i = 0; i < 256; i++) {
+    let best = off, bd = Infinity;
+    for (let i = off; i < 256; i++) {
       const dr = r - pal[i * 3], dg = g - pal[i * 3 + 1], db = b - pal[i * 3 + 2];
       const d = dr * dr + dg * dg + db * db;
       if (d < bd) { bd = d; best = i; }
     }
     cache.set(key, best); return best;
   };
+}
+/* GIF 只有一个透明色索引，半透明像素必须被「摊派」成 透/不透 两种结果。
+   进来的 px 一律是直通色 + alpha（两个出口各自负责还原，见 resampleLZ）。
+   matte 是这张 GIF 将来被叠在什么颜色上：判成「不透」的像素会把 m(1−a) 预先合成进色表，
+   所以边缘只有对着 matte 看才对得上原图，查看方换背景就会偏。
+   摊法固定用误差扩散：切不完的覆盖率往后邻像素推，边缘从中距离看浓淡和原图一致。 */
+function quantizeFrame(px, w, h, map, opt) {
+  const n = w * h, idx = new Uint8Array(n);
+  const { alpha, mr, mg, mb } = opt;
+  if (!alpha) {
+    for (let p = 0, q = 0; p < n; p++, q += 4) idx[p] = map(px[q], px[q + 1], px[q + 2]);
+    return idx;
+  }
+  const err = new Float32Array(n + w + 1);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const p = y * w + x, q = p * 4;
+      const cov = px[q + 3] / 255;
+      let a = cov + err[p];
+      a = a < 0 ? 0 : a > 1 ? 1 : a;
+      const e = cov - a;
+      if (e) {
+        err[p + 1] += e * 0.4375; err[p + w] += e * 0.3125;
+        err[p + w + 1] += e * 0.1875; err[p + w + 2] += e * 0.0625;
+      }
+      if (a < 0.5) { idx[p] = 0; continue; }
+      /* px[q] 是直通色 c。GIF 只有二值透明，被判定为「不透」的那批像素会以 k=1 显示，
+         查看器不会再乘一次覆盖率——所以该存的就是合成结果 c·a + m(1−a)，
+         把 matte 的贡献预先画进色表。乘 a 只会变小，不会溢出，无需特殊处理小 a。 */
+      const ri = Math.round(px[q] * a + mr * (1 - a));
+      const gi = Math.round(px[q + 1] * a + mg * (1 - a));
+      const bi = Math.round(px[q + 2] * a + mb * (1 - a));
+      idx[p] = map(ri < 0 ? 0 : ri > 255 ? 255 : ri,
+                   gi < 0 ? 0 : gi > 255 ? 255 : gi,
+                   bi < 0 ? 0 : bi > 255 ? 255 : bi);
+    }
+  }
+  return idx;
 }
 class Bits {
   constructor() { this.a = []; this.cur = 0; this.n = 0; }
@@ -828,21 +923,32 @@ function lzw(idx) {                        // GIF LZW，minCodeSize 固定 8
   bw.write(cur, size); bw.write(eoi, size);
   return bw.end();
 }
-function gifBytes(pal, indexFrames, w, h, delayMs) {
+function gifBytes(pal, indexFrames, w, h, delayMs, alpha) {
   const enc = s => new TextEncoder().encode(s);
   const parts = [];
   const hdr = new Uint8Array(13);
   hdr.set(enc('GIF89a'), 0);
   hdr[6] = w & 255; hdr[7] = w >> 8; hdr[8] = h & 255; hdr[9] = h >> 8;
   hdr[10] = 0x87; hdr[11] = 0; hdr[12] = 0;                    // GCT 256 色
-  parts.push(hdr, pal);
+  parts.push(hdr);
+  /* 透明色固定用索引 0：GCE 只能指定一个索引值，把它放在 0 号槽，
+     调色板整体后移一格，就不会有实色像素被误判成透明 */
+  const gct = new Uint8Array(768);
+  if (alpha) gct.set(pal.subarray(3), 3); else gct.set(pal, 0);
+  parts.push(gct);
   const app = new Uint8Array(19);
   app.set([0x21, 0xFF, 0x0B], 0); app.set(enc('NETSCAPE2.0'), 3);
   app[14] = 3; app[15] = 1; app[16] = 0; app[17] = 0; app[18] = 0;   // 无限循环
   parts.push(app);
   const delay = Math.max(2, Math.round(delayMs / 10));
+  /* 透明用索引 0（GCE 第 7 字节），处置用 2=还原背景：
+     每帧都是整幅重画，处置=1 会让上一帧的边缘留在透明处（动画拖影），
+     而预览是逐帧独立画的，只有 2 才对得上 */
+  const gceFlags = alpha ? 0x09 : 0x04;
   for (const idx of indexFrames) {
-    const gce = new Uint8Array([0x21, 0xF9, 4, 0x04, delay & 255, delay >> 8, 0, 0]);
+    /* GCE 共 8 字节：0x21 0xF9 | 块长 4 | 处置+延时+透明索引 4 字节 | 块终止符 0
+       透明索引固定 0，第 7 字节与终止符都是 0，但不能多写一个 */
+    const gce = new Uint8Array([0x21, 0xF9, 4, gceFlags, delay & 255, delay >> 8, 0, 0x00]);
     const desc = new Uint8Array(10);
     desc[0] = 0x2C; desc[5] = w & 255; desc[6] = w >> 8; desc[7] = h & 255; desc[8] = h >> 8;
     const code = lzw(idx);
@@ -873,29 +979,78 @@ async function exportGif() {
   if (!ok) { toast('导出参数不合法：宽高要整数≥1、帧数≥2、时长≥20ms', true); return; }
   setPlay(false);
   const t0 = performance.now(), bw = CW(), bh = CH(), N = scene.frames;
+  const alpha = !!scene.alpha;
+  const matte = /^#[0-9a-f]{6}$/i.test(scene.alphaMatte || '') ? scene.alphaMatte : '#ffffff';
+  const opt = { alpha,
+                mr: parseInt(matte.slice(1, 3), 16), mg: parseInt(matte.slice(3, 5), 16),
+                mb: parseInt(matte.slice(5, 7), 16) };
   const big = document.createElement('canvas');
   big.width = bw; big.height = bh;
   const c1 = big.getContext('2d', { willReadFrequently: true });
-  let pal = null, map = null;
-  const frames = [];
-  $('#status').textContent = '导出中…';
+  /* 一遍渲染、缓存缩好的像素：先挑几帧建全局调色板，再逐帧量化。
+     渲染（尤其带扫光的 getImageData/putImageData）是最贵的一步，不能为建表多付一遍。 */
+  /* 建表取样：均匀挑最多 8 帧，首尾必取。s 只能当目标数，不能同时当计数器，
+     否则 sampleSet 永远追不上 s，循环不结束（整页会卡死在这里） */
+  const ns = Math.min(8, N), sampleSet = new Set();
+  for (let k = 0; k < ns; k++) sampleSet.add(Math.round(k * (N - 1) / (ns - 1)));
+  const pxs = new Array(N);
+  let done = 0;
   for (let i = 0; i < N; i++) {
-    paintFrame(c1, bw, bh, i);
-    const px = resampleLZ(c1.getImageData(0, 0, bw, bh).data, bw, bh, scene.w, scene.h);
-    if (!pal) { pal = paletteOf(px); map = colorMapper(pal); }
-    const w = scene.w, h = scene.h, idx = new Uint8Array(w * h);
-    for (let p = 0, q = 0; p < w * h; p++, q += 4)
-      idx[p] = map(px[q], px[q + 1], px[q + 2]);
-    frames.push(idx);
-    $('#status').textContent = '导出中 ' + (i + 1) + '/' + N;
-    if (i % 4 === 3) await tick();
+    paintFrame(c1, bw, bh, i, alpha);
+    pxs[i] = resampleLZ(c1.getImageData(0, 0, bw, bh).data, bw, bh, scene.w, scene.h, alpha);
+    progress('导出中 · 渲染 ' + (++done) + '/' + N);
+    if (i % 3 === 2) await tick();
   }
-  const blob = new Blob(gifBytes(pal, frames, scene.w, scene.h, scene.duration),
+  const pal = paletteOf(mergeSamples([...sampleSet].sort((a, b) => a - b)
+                                      .map(i => (alpha ? compMatte(pxs[i], opt) : pxs[i]))), alpha);
+  const map = colorMapper(pal, alpha);
+  const frames = [];
+  for (let i = 0; i < N; i++) {
+    frames.push(quantizeFrame(pxs[i], scene.w, scene.h, map, opt));
+    pxs[i] = null;
+    progress('导出中 · 量化 ' + (++done) + '/' + (N * 2));
+    if (i % 8 === 7) await tick();
+  }
+  const blob = new Blob(gifBytes(pal, frames, scene.w, scene.h, scene.duration, alpha),
                         { type: 'image/gif' });
-  save(blob, projectName() + '.gif');
+  progress('导出中 · LZW');
+  await tick();
+  save(blob, projectName() + (alpha ? '_透明' : '') + '.gif');
   const secs = ((performance.now() - t0) / 1000).toFixed(1);
-  $('#status').textContent = '';
   toast('已导出到「下载」 · ' + Math.max(1, Math.round(blob.size / 1024)) + 'kb · ' + secs + 's');
+}
+/* 建表取样按 matte 合成，而不是把半透明像素丢掉：quantizeFrame 写进色表的正是这种
+   合成色（c·a + m(1−a)），色表里没有它们的近邻，边缘就会被拽回素材本体的深色。
+   a<8 的是真透明、不占槽；实心像素 a=255 时合成色等于原色，本体颜色一个不丢。 */
+function compMatte(px, opt) {
+  const out = new Uint8Array(px.length);
+  let n = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    const a = px[i + 3];
+    if (a < 8) continue;
+    const k = a / 255;
+    out[n] = px[i] * k + opt.mr * (1 - k);
+    out[n + 1] = px[i + 1] * k + opt.mg * (1 - k);
+    out[n + 2] = px[i + 2] * k + opt.mb * (1 - k);
+    out[n + 3] = 255;
+    n += 4;
+  }
+  return out.subarray(0, n);
+}
+/* 取样按像素数封顶：中位切分的开销跟着色数走，8 帧全量足够建表，再多只拖时间 */
+function mergeSamples(list, maxPx = 30000) {
+  const totalPx = list.reduce((s, a) => s + a.length / 4, 0);
+  const stride = Math.max(1, Math.ceil(totalPx / maxPx));
+  const keep = list.reduce((s, a) => s + Math.ceil(a.length / 4 / stride), 0);
+  const out = new Uint8Array(keep * 4);
+  let o = 0;
+  for (const a of list) {
+    for (let i = 0; i + 3 < a.length; i += stride * 4) {
+      out[o] = a[i]; out[o + 1] = a[i + 1]; out[o + 2] = a[i + 2]; out[o + 3] = a[i + 3];
+      o += 4;
+    }
+  }
+  return out.subarray(0, o);
 }
 function save(blob, filename) {
   const a = document.createElement('a');
@@ -941,7 +1096,9 @@ async function applyProject(o, nameFallback) {
   scene = { name: o.name || nameFallback, dir: o.dir || '',
             out: o.out || 'loop.gif', w: num(o.w, 300, 1, 4096), h: num(o.h, 300, 1, 4096),
             frames: num(o.frames, 32, 2, 500), duration: num(o.duration, 50, 20, 1000),
-            stack: o.stack.map(String), animate: o.animate || {} };
+            stack: o.stack.map(String), animate: o.animate || {},
+            alpha: !!o.alpha,
+            alphaMatte: /^#[0-9a-f]{6}$/i.test(o.alphaMatte || '') ? o.alphaMatte : '#ffffff' };
   sel = scene.stack.at(-1) || null;
   cur = 0; setPlay(false); refresh();
   toast('已载入 ' + scene.stack.length + ' 张素材');
@@ -967,11 +1124,21 @@ let toastTimer = null;
 function toast(msg, bad) {
   $('#toastMsg').textContent = msg;
   const el = $('#toast');
+  el.classList.remove('run');
   el.classList.toggle('bad', !!bad);
   el.querySelector('path').setAttribute('d', bad ? 'M4 4l8 8M12 4l-8 8' : 'M3 8.6l3.1 3.1L13 4.8');
   el.classList.add('on');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.classList.remove('on'), 3200);
+}
+/* 导出进度也走这个底部提示：它既不是成功也不是失败，所以挂 run 态把图标收起来，
+   并且不设 3200ms 自动收起——下一条进度会覆盖文案，收尾交给 toast()。 */
+function progress(msg) {
+  $('#toastMsg').textContent = msg;
+  const el = $('#toast');
+  el.classList.remove('bad');
+  el.classList.add('run', 'on');
+  clearTimeout(toastTimer);
 }
 
 /* ---------- 全局弹窗 ---------- */
