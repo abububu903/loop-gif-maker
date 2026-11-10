@@ -331,8 +331,9 @@ function clearAssets() {
 
 /* ---------- 帧渲染（与 gif_engine.render 同数学） ---------- */
 const sine = (a, t) => {
-  const s = Math.sin(TAU * ((a.cycles ?? 1) * t + (a.phase ?? 0)));
-  return [(a.x || 0) * s, (a.y || 0) * s];
+  const c = a.cycles ?? 1, ph = a.phase ?? 0;   // 老工程的单一 phase 作 X/Y 兜底，新工程用 xphase/yphase
+  return [(a.x || 0) * Math.sin(TAU * (c * t + (a.xphase ?? ph))),
+          (a.y || 0) * Math.sin(TAU * (c * t + (a.yphase ?? ph)))];
 };
 
 /* 带宽默认随切片画布走：光带 σ 要明显窄于画布才看得出「扫」，600px→72、80px→8 */
@@ -367,16 +368,18 @@ function paintFrame(ctx, w, h, i, alpha) {
     const sx = dw / w, sy = dh / h;
     let dx = 0, dy = 0;
     if (an.translate) { const [x, y] = sine(an.translate, t); dx = Math.round(x); dy = Math.round(y); }
-    let s = 1, ax = w / 2, ay = h / 2;
+    let kx = 1, ky = 1, ax = w / 2, ay = h / 2;
     if (an.scale) {
       const sc = an.scale;
-      s = 1 + (sc.amp || 0) * Math.sin(TAU * ((sc.cycles ?? 1) * t + (sc.phase ?? 0)));
+      const s = 1 + (sc.amp || 0) * Math.sin(TAU * ((sc.cycles ?? 1) * t + (sc.phase ?? 0)));
+      if (sc.axis !== 'y') kx = s;
+      if (sc.axis !== 'x') ky = s;
       if (sc.anchor === 'bottom-center') ay = h;
       else if (sc.anchor === 'asset') { ax = (a.bbox[0] + a.bbox[2]) / 2; ay = (a.bbox[1] + a.bbox[3]) / 2; }
     }
     ctx.save();
-    ctx.translate(dx + ax * (1 - s), dy + ay * (1 - s));
-    ctx.scale(s, s);
+    ctx.translate(dx + ax * (1 - kx), dy + ay * (1 - ky));
+    ctx.scale(kx, ky);
     if (an.rotate) {
       const p = pivotOf(an.rotate.pivot_layer || name);
       ctx.translate(p[0], p[1]);
@@ -715,7 +718,8 @@ function renderProps() {
     f.appendChild(grp('位移', body([
       pair(fld('X振幅', k('tx'), 'number', { step: 0.5 }),
            fld('Y振幅', k('ty'), 'number', { step: 0.5 })),
-      fld('相位', k('tp'), 'number', { step: 0.05, solo: true })])));
+      pair(fld('X相位', k('tpx'), 'number', { step: 0.05 }),
+           fld('Y相位', k('tpy'), 'number', { step: 0.05 }))])));
 
     f.appendChild(grp('旋转', body([
       pair(fld('圈数', k('rt'), 'number', { step: 0.25 }),
@@ -723,6 +727,8 @@ function renderProps() {
 
     f.appendChild(grp('缩放呼吸', body([
       pair(fld('振幅', k('sa'), 'number', { step: 0.005 }),
+           fld('相位', k('sp'), 'number', { step: 0.05 })),
+      pair(fld('轴向', k('sax'), 'select', [['both', '双向'], ['x', '仅X'], ['y', '仅Y']]),
            fld('锚点', k('sc'), 'select', [['center', '中心'], ['bottom-center', '底部居中'],
                                           ['asset', sel]]))])));
 
@@ -754,11 +760,14 @@ function syncLayerKeys() {
   const sh = a.shimmer;
   setPath(scene, p('tx'), a.translate?.x ?? 0);
   setPath(scene, p('ty'), a.translate?.y ?? 0);
-  setPath(scene, p('tp'), a.translate?.phase ?? 0);
+  setPath(scene, p('tpx'), a.translate?.xphase ?? a.translate?.phase ?? 0);
+  setPath(scene, p('tpy'), a.translate?.yphase ?? a.translate?.phase ?? 0);
   setPath(scene, p('rt'), a.rotate?.turns ?? 0);
   setPath(scene, p('rp'), a.rotate?.pivot_layer ?? sel);
   setPath(scene, p('sa'), a.scale?.amp ?? 0);
   setPath(scene, p('sc'), a.scale?.anchor ?? 'center');
+  setPath(scene, p('sp'), a.scale?.phase ?? 0);
+  setPath(scene, p('sax'), a.scale?.axis ?? 'both');
   setPath(scene, p('shon'), !!sh);
   setPath(scene, p('shs'), sh?.strength ?? 0.45);
   setPath(scene, p('shw'), sh?.width ?? shimW0());
@@ -772,10 +781,12 @@ function commitLayerKeys() {
   if (!sel || !scene?.[sel]) return;
   const p = k => getPath(scene, [sel, k]);
   const a = scene.animate[sel] ??= {};
-  a.translate = { x: p('tx') || 0, y: p('ty') || 0, phase: p('tp') || 0 };
+  a.translate = { x: p('tx') || 0, y: p('ty') || 0,
+    xphase: p('tpx') || 0, yphase: p('tpy') || 0 };
   if (p('rt')) a.rotate = { turns: p('rt'), pivot_layer: p('rp') || sel };
   else delete a.rotate;
-  if (p('sa')) a.scale = { amp: p('sa'), anchor: p('sc') || 'center' };
+  if (p('sa')) a.scale = { amp: p('sa'), anchor: p('sc') || 'center',
+    phase: p('sp') || 0, axis: p('sax') || 'both' };
   else delete a.scale;
   if (p('shon')) a.shimmer = { strength: p('shs') ?? 0.45, width: p('shw') ?? shimW0(),
     slope: p('shsl') ?? 0.35, range: [p('shr0') ?? 0, p('shr1') ?? 255] };
